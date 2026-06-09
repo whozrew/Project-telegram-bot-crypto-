@@ -115,6 +115,13 @@ def analyze_coin(symbol: str) -> Optional[SignalResult]:
     ticker = market_cache.get_ticker(symbol)
     price = market_cache.get_price(symbol)
 
+    print("========== DEBUG ==========")
+    print("SYMBOL:", symbol)
+    print("DF EXISTS:", df is not None)
+    print("TICKER EXISTS:", ticker is not None)
+    print("PRICE:", price)
+    print("==========================")
+
     if df is None or len(df) < 50:
         return None
     if not price or price <= 0:
