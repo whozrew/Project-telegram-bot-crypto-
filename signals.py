@@ -295,7 +295,7 @@ def analyze_coin(symbol: str) -> Optional[SignalResult]:
         signal = SIGNAL_WAIT
 
     else:
-        signal = SIGNAL_NO_ENTRY
+        signal = SIGNAL_WAIT
 
     # Trend
     if ema20_val > ema50_val > ema200_val and price > ema20_val:
