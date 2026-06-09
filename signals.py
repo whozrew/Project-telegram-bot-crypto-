@@ -278,17 +278,17 @@ def analyze_coin(symbol: str) -> Optional[SignalResult]:
     max_score = 20.0
     norm_score = max(-max_score, min(max_score, score))
 
-  if score >= 85:
-    signal = SIGNAL_ENTRY
+    if score >= 85:
+        signal = SIGNAL_ENTRY
 
-elif score >= 70:
-    signal = SIGNAL_WATCH
+    elif score >= 70:
+        signal = SIGNAL_WATCH
 
-elif score >= 50:
-    signal = SIGNAL_WAIT
+    elif score >= 50:
+        signal = SIGNAL_WAIT
 
-else:
-    signal = SIGNAL_NO_ENTRY
+    else:
+        signal = SIGNAL_NO_ENTRY
 
     # Trend
     if ema20_val > ema50_val > ema200_val and price > ema20_val:
