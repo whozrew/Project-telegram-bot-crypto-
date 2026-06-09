@@ -291,10 +291,7 @@ def analyze_coin(symbol: str) -> Optional[SignalResult]:
     elif score >= 70:
         signal = SIGNAL_WATCH
 
-    elif score >= 50:
-        signal = SIGNAL_WAIT
-
-    else:
+    else: score >= 50:
         signal = SIGNAL_WAIT
 
     # Trend
