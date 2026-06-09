@@ -115,13 +115,6 @@ def analyze_coin(symbol: str) -> Optional[SignalResult]:
     ticker = market_cache.get_ticker(symbol)
     price = market_cache.get_price(symbol)
 
-    print("========== DEBUG ==========")
-    print("SYMBOL:", symbol)
-    print("DF EXISTS:", df is not None)
-    print("TICKER EXISTS:", ticker is not None)
-    print("PRICE:", price)
-    print("==========================")
-
     if df is None or len(df) < 50:
         return None
     if not price or price <= 0:
@@ -285,14 +278,31 @@ def analyze_coin(symbol: str) -> Optional[SignalResult]:
     max_score = 20.0
     norm_score = max(-max_score, min(max_score, score))
 
-    if score >= 85:
-        signal = SIGNAL_ENTRY
-
-    elif score >= 70:
-        signal = SIGNAL_WATCH
-
-    else: score >= 50:
-        signal = SIGNAL_WAIT
+    if score >= 8:
+        signal_type = "KUCHLI_SOTIB_OLISH"
+        confidence = min(95, 65 + int(score * 2))
+        risk_level = "past"
+        reasons = reasons_buy[:5]
+    elif score >= 4:
+        signal_type = "SOTIB_OLISH"
+        confidence = min(80, 55 + int(score * 2))
+        risk_level = "o'rta"
+        reasons = reasons_buy[:4]
+    elif score <= -8:
+        signal_type = "KUCHLI_SOTISH"
+        confidence = min(90, 65 + int(abs(score) * 2))
+        risk_level = "yuqori"
+        reasons = reasons_sell[:5]
+    elif score <= -4:
+        signal_type = "SOTISH"
+        confidence = min(75, 55 + int(abs(score) * 2))
+        risk_level = "yuqori"
+        reasons = reasons_sell[:4]
+    else:
+        signal_type = "KUTISH"
+        confidence = 50
+        risk_level = "o'rta"
+        reasons = reasons_neutral[:3] or ["Bozor yo'nalishi noaniq", "Kuchli signal kutilmoqda"]
 
     # Trend
     if ema20_val > ema50_val > ema200_val and price > ema20_val:
