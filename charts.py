@@ -1,274 +1,344 @@
 """
-Halol Crypto AI Bot - Grafik generatsiya moduli
+charts.py - HALOL CRYPTO AI BOT V3.5
+Professional qoʻngʻiroq grafiklari - Kirish, Stop Loss, TP darajalari
 """
+
 import io
 import logging
-import asyncio
-from typing import Optional, Tuple
-
 import numpy as np
-import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
-from matplotlib.patches import Rectangle
-from matplotlib.lines import Line2D
+import matplotlib.patches as mpatches
+from matplotlib.patches import FancyBboxPatch
+from matplotlib.gridspec import GridSpec
+from typing import Optional, List, Tuple
 
-from config import CHART_DPI, CHART_FIGSIZE
-from scanner import market_cache
-from signals import SignalResult, calc_rsi, calc_ema, calc_macd, calc_bollinger_bands
+from signals import SignalResult, OHLCV
+from config import CHART_CONFIG, INDICATOR_PARAMS
+from utils import ema, sma, calc_rsi, calc_macd
 
 logger = logging.getLogger(__name__)
 
-# ──────────────────────────────────────────────
-# RANGLAR
-# ──────────────────────────────────────────────
-COLORS = {
-    "bg": "#0d1117",
-    "panel": "#161b22",
-    "text": "#c9d1d9",
-    "text_dim": "#8b949e",
-    "green": "#3fb950",
-    "red": "#f85149",
-    "yellow": "#e3b341",
-    "blue": "#58a6ff",
-    "purple": "#bc8cff",
-    "orange": "#f0883e",
-    "grid": "#21262d",
-    "candle_up": "#3fb950",
-    "candle_down": "#f85149",
-    "ema20": "#f0883e",
-    "ema50": "#bc8cff",
-    "ema200": "#58a6ff",
-    "macd": "#3fb950",
-    "signal": "#f85149",
-    "rsi": "#f0883e",
-    "volume": "#30363d",
-    "entry": "#3fb950",
-    "sl": "#f85149",
-    "tp": "#58a6ff",
-    "support": "#e3b341",
-    "resistance": "#bc8cff",
-}
+# Qoʻngʻiroq konfiguratsiyasini tortib olish
+CC = CHART_CONFIG
+P = INDICATOR_PARAMS
 
 
-def _apply_dark_style(ax, title: str = ""):
-    ax.set_facecolor(COLORS["panel"])
-    ax.tick_params(colors=COLORS["text_dim"], labelsize=8)
-    ax.spines["bottom"].set_color(COLORS["grid"])
-    ax.spines["left"].set_color(COLORS["grid"])
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    ax.yaxis.tick_right()
-    ax.yaxis.set_label_position("right")
-    ax.grid(True, color=COLORS["grid"], linewidth=0.5, alpha=0.6)
-    if title:
-        ax.set_title(title, color=COLORS["text_dim"], fontsize=8, pad=4)
+# ============================================================
+# ASOSIY GRAFIK YARATISH
+# ============================================================
 
-
-def _format_price_label(price: float) -> str:
-    if price >= 1000:
-        return f"${price:,.1f}"
-    elif price >= 1:
-        return f"${price:.3f}"
-    elif price >= 0.001:
-        return f"${price:.5f}"
-    return f"${price:.8f}"
-
-
-async def generate_signal_chart(result: SignalResult) -> Optional[bytes]:
-    """Signal grafigi yaratish (async wrapper)"""
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _create_chart, result)
-
-
-def _create_chart(result: SignalResult) -> Optional[bytes]:
-    """Grafik yaratish (sinxron, executor'da ishlaydi)"""
+def generate_chart(ohlcv: OHLCV, signal: SignalResult) -> Optional[bytes]:
+    """
+    Professional dark theme grafik yaratish.
+    Candlestick + EMA + Support/Resistance + Order Blocks +
+    FVG + Entry/SL/TP + Volume + RSI + MACD panellari.
+    """
     try:
-        df = market_cache.get_klines(result.symbol)
-        if df is None or len(df) < 50:
-            return None
+        n = min(ohlcv.length, 100)  # Oxirgi 100 mum
+        o = ohlcv.open[-n:]
+        h = ohlcv.high[-n:]
+        lo = ohlcv.low[-n:]
+        c = ohlcv.close[-n:]
+        v = ohlcv.volume[-n:]
+        x = np.arange(n)
 
-        # So'nggi 80 shamchani olish
-        df = df.tail(80).copy().reset_index(drop=True)
+        fig = plt.figure(figsize=CC["FIGSIZE"], dpi=CC["DPI"])
+        fig.patch.set_facecolor(CC["BACKGROUND_COLOR"])
 
-        close = df["close"]
-        high = df["high"]
-        low = df["low"]
-        open_ = df["open"]
-        volume = df["volume"]
-
-        # Indikatorlar
-        rsi = calc_rsi(close)
-        ema20 = calc_ema(close, 20)
-        ema50 = calc_ema(close, 50)
-        ema200 = calc_ema(close, 200)
-        macd_line, signal_line, histogram = calc_macd(close)
-
-        # ──────────────────────────────
-        # Figure va panellar
-        # ──────────────────────────────
-        fig = plt.figure(figsize=CHART_FIGSIZE, dpi=CHART_DPI, facecolor=COLORS["bg"])
-        gs = gridspec.GridSpec(4, 1, figure=fig,
-                               height_ratios=[4, 1.2, 1.2, 0.8],
-                               hspace=0.04, left=0.02, right=0.88,
-                               top=0.93, bottom=0.06)
-
-        ax_price = fig.add_subplot(gs[0])
-        ax_volume = fig.add_subplot(gs[1], sharex=ax_price)
-        ax_macd = fig.add_subplot(gs[2], sharex=ax_price)
-        ax_rsi = fig.add_subplot(gs[3], sharex=ax_price)
-
-        x = np.arange(len(df))
-
-        # ──────────────────────────────
-        # 1. SHAMCHALAR
-        # ──────────────────────────────
-        _apply_dark_style(ax_price)
-        for i in range(len(df)):
-            o, c, h, l = float(open_.iloc[i]), float(close.iloc[i]), float(high.iloc[i]), float(low.iloc[i])
-            color = COLORS["candle_up"] if c >= o else COLORS["candle_down"]
-            body_h = abs(c - o)
-            body_y = min(o, c)
-            if body_h == 0:
-                body_h = c * 0.001
-            rect = Rectangle((i - 0.35, body_y), 0.7, body_h,
-                              color=color, linewidth=0, zorder=3)
-            ax_price.add_patch(rect)
-            ax_price.plot([i, i], [l, min(o, c)], color=color, linewidth=0.8, zorder=2)
-            ax_price.plot([i, i], [max(o, c), h], color=color, linewidth=0.8, zorder=2)
-
-        # EMA chiziqlar
-        ax_price.plot(x, ema20, color=COLORS["ema20"], linewidth=1.2,
-                      label="EMA 20", alpha=0.9, zorder=4)
-        ax_price.plot(x, ema50, color=COLORS["ema50"], linewidth=1.2,
-                      label="EMA 50", alpha=0.9, zorder=4)
-        ax_price.plot(x, ema200, color=COLORS["ema200"], linewidth=1.2,
-                      label="EMA 200", alpha=0.9, zorder=4)
-
-        # Qo'llab-quvvatlash / Qarshilik
-        if result.support:
-            ax_price.axhline(result.support, color=COLORS["support"],
-                             linewidth=1.0, linestyle="--", alpha=0.7, label="Qo'llab")
-        if result.resistance:
-            ax_price.axhline(result.resistance, color=COLORS["resistance"],
-                             linewidth=1.0, linestyle="--", alpha=0.7, label="Qarshilik")
-
-        # Kirish / SL / TP zonalar
-        if result.entry_low and result.entry_high:
-            ax_price.axhspan(result.entry_low, result.entry_high,
-                             alpha=0.12, color=COLORS["entry"], label="Kirish zonasi")
-        if result.stop_loss and result.stop_loss > 0:
-            ax_price.axhline(result.stop_loss, color=COLORS["sl"],
-                             linewidth=1.2, linestyle="-.", alpha=0.8, label="Stop Loss")
-        if result.take_profit_1 and result.take_profit_1 > 0:
-            ax_price.axhline(result.take_profit_1, color=COLORS["tp"],
-                             linewidth=1.2, linestyle="-.", alpha=0.8, label="TP 1")
-        if result.take_profit_2 and result.take_profit_2 > 0:
-            ax_price.axhline(result.take_profit_2, color=COLORS["tp"],
-                             linewidth=0.8, linestyle=":", alpha=0.6, label="TP 2")
-
-        # Joriy narx chizig'i
-        ax_price.axhline(result.price, color=COLORS["yellow"],
-                         linewidth=0.8, alpha=0.6)
-
-        # Legenda
-        legend = ax_price.legend(loc="upper left", fontsize=7,
-                                  facecolor=COLORS["panel"],
-                                  edgecolor=COLORS["grid"],
-                                  labelcolor=COLORS["text"])
-
-        # Sarlavha
-        from config import SIGNAL_NAMES, SIGNAL_EMOJI
-        sig_name = SIGNAL_NAMES.get(result.signal_type, result.signal_type)
-        sig_em = SIGNAL_EMOJI.get(result.signal_type, "")
-        title_text = (
-            f"{result.symbol}/USDT  |  1H  |  "
-            f"{sig_em} {sig_name}  |  "
-            f"{_format_price_label(result.price)}  |  "
-            f"Ishonchlilik: {result.confidence}%"
+        gs = GridSpec(
+            4, 1, figure=fig,
+            height_ratios=[5, 1.5, 1.5, 1.5],
+            hspace=0.04
         )
-        ax_price.set_title(title_text, color=COLORS["text"], fontsize=10,
+
+        ax_price  = fig.add_subplot(gs[0])
+        ax_vol    = fig.add_subplot(gs[1], sharex=ax_price)
+        ax_rsi    = fig.add_subplot(gs[2], sharex=ax_price)
+        ax_macd   = fig.add_subplot(gs[3], sharex=ax_price)
+
+        for ax in [ax_price, ax_vol, ax_rsi, ax_macd]:
+            ax.set_facecolor(CC["BACKGROUND_COLOR"])
+            ax.tick_params(colors=CC["TEXT_COLOR"], labelsize=8)
+            ax.spines[:].set_color(CC["GRID_COLOR"])
+            ax.grid(color=CC["GRID_COLOR"], linewidth=0.5, alpha=0.7)
+
+        # ---- MUBDIR GRAFIK (CANDLESTICK) ----
+        _draw_candlesticks(ax_price, x, o, h, lo, c)
+
+        # ---- EMA CHIZIQLARI ----
+        _draw_emas(ax_price, c, x, n)
+
+        # ---- SUPPORT & RESISTANCE ----
+        struct = signal.structure
+        if struct.get("support"):
+            ax_price.axhline(
+                struct["support"], color=CC["SUPPORT_COLOR"],
+                linewidth=1.5, linestyle="--", alpha=0.8, label="Support"
+            )
+        if struct.get("resistance"):
+            ax_price.axhline(
+                struct["resistance"], color=CC["RESISTANCE_COLOR"],
+                linewidth=1.5, linestyle="--", alpha=0.8, label="Resistance"
+            )
+
+        # ---- ORDER BLOCKS ----
+        ob_bull = struct.get("order_block_bull")
+        if ob_bull and isinstance(ob_bull, (list, tuple)) and len(ob_bull) == 2:
+            _draw_zone(ax_price, x, ob_bull[0], ob_bull[1], CC["OB_BULL_COLOR"], "Bull OB")
+
+        ob_bear = struct.get("order_block_bear")
+        if ob_bear and isinstance(ob_bear, (list, tuple)) and len(ob_bear) == 2:
+            _draw_zone(ax_price, x, ob_bear[0], ob_bear[1], CC["OB_BEAR_COLOR"], "Bear OB")
+
+        # ---- FVG ZONASI ----
+        fvg_bull = struct.get("fvg_bull")
+        if fvg_bull and isinstance(fvg_bull, (list, tuple)) and len(fvg_bull) == 2:
+            _draw_zone(ax_price, x, fvg_bull[0], fvg_bull[1], CC["FVG_COLOR"], "FVG")
+
+        # ---- KIRISH, STOP LOSS, TP DARAJALARI ----
+        price = signal.price
+        if price > 0:
+            ax_price.axhline(price, color=CC["ENTRY_COLOR"],
+                             linewidth=2, linestyle="-", alpha=0.9)
+            ax_price.annotate(
+                f"📍 Kirish: {_fmt(price)}",
+                xy=(n - 1, price), xytext=(n - 15, price),
+                color=CC["ENTRY_COLOR"], fontsize=8, fontweight="bold",
+                va="center"
+            )
+
+        if signal.stop_loss > 0:
+            ax_price.axhline(signal.stop_loss, color=CC["SL_COLOR"],
+                             linewidth=1.5, linestyle="-.", alpha=0.9)
+            ax_price.annotate(
+                f"🛑 SL: {_fmt(signal.stop_loss)}",
+                xy=(n - 1, signal.stop_loss), xytext=(n - 15, signal.stop_loss),
+                color=CC["SL_COLOR"], fontsize=7, va="center"
+            )
+
+        _draw_tp_levels(ax_price, signal, n)
+
+        # ---- GRAFIK SARLAVHASI ----
+        from config import SIGNALS
+        sig_info = SIGNALS.get(signal.signal_type, {})
+        sig_emoji = sig_info.get("emoji", "📊")
+        sig_name = sig_info.get("name", signal.signal_type)
+
+        title = (
+            f"{signal.symbol} | {sig_emoji} {sig_name} | "
+            f"Ishonch: {signal.confidence}% | Kirish Sifati: {signal.entry_quality}/100 | "
+            f"{signal.timeframe.upper()}"
+        )
+        ax_price.set_title(title, color=CC["TEXT_COLOR"], fontsize=10,
                            fontweight="bold", pad=8)
-        ax_price.set_xlim(-1, len(df) + 1)
-        ax_price.tick_params(labelbottom=False)
-        ax_price.yaxis.tick_right()
-        ax_price.tick_params(axis="y", colors=COLORS["text_dim"], labelsize=8)
-        ax_price.set_facecolor(COLORS["panel"])
-        ax_price.spines["bottom"].set_color(COLORS["grid"])
-        ax_price.spines["left"].set_color(COLORS["grid"])
-        ax_price.spines["top"].set_visible(False)
-        ax_price.spines["right"].set_visible(False)
-        ax_price.grid(True, color=COLORS["grid"], linewidth=0.4, alpha=0.5)
+        ax_price.set_ylabel("Narx", color=CC["TEXT_COLOR"], fontsize=8)
 
-        # ──────────────────────────────
-        # 2. HAJM
-        # ──────────────────────────────
-        _apply_dark_style(ax_volume, "Hajm")
-        vol_colors = [COLORS["candle_up"] if float(close.iloc[i]) >= float(open_.iloc[i])
-                      else COLORS["candle_down"] for i in range(len(df))]
-        ax_volume.bar(x, volume, color=vol_colors, width=0.7, alpha=0.7)
-        avg_vol = volume.rolling(20).mean()
-        ax_volume.plot(x, avg_vol, color=COLORS["yellow"], linewidth=1.0, alpha=0.8)
-        ax_volume.tick_params(labelbottom=False, colors=COLORS["text_dim"], labelsize=7)
-        ax_volume.yaxis.set_major_formatter(
-            matplotlib.ticker.FuncFormatter(lambda v, _: f"{v/1e6:.1f}M" if v >= 1e6 else f"{v/1e3:.0f}K")
-        )
+        # ---- HAJM PANELI ----
+        _draw_volume(ax_vol, x, v, o, c)
+        ax_vol.set_ylabel("Hajm", color=CC["TEXT_COLOR"], fontsize=7)
 
-        # ──────────────────────────────
-        # 3. MACD
-        # ──────────────────────────────
-        _apply_dark_style(ax_macd, "MACD")
-        hist_colors = [COLORS["green"] if v >= 0 else COLORS["red"]
-                       for v in histogram.values]
-        ax_macd.bar(x, histogram, color=hist_colors, width=0.7, alpha=0.7)
-        ax_macd.plot(x, macd_line, color=COLORS["macd"], linewidth=1.0, label="MACD")
-        ax_macd.plot(x, signal_line, color=COLORS["signal"], linewidth=1.0, label="Signal")
-        ax_macd.axhline(0, color=COLORS["grid"], linewidth=0.8)
-        ax_macd.tick_params(labelbottom=False, colors=COLORS["text_dim"], labelsize=7)
+        # ---- RSI PANELI ----
+        _draw_rsi(ax_rsi, c, x, n)
+        ax_rsi.set_ylabel("RSI", color=CC["TEXT_COLOR"], fontsize=7)
 
-        # ──────────────────────────────
-        # 4. RSI
-        # ──────────────────────────────
-        _apply_dark_style(ax_rsi, "RSI (14)")
-        ax_rsi.plot(x, rsi, color=COLORS["rsi"], linewidth=1.2)
-        ax_rsi.axhline(70, color=COLORS["red"], linewidth=0.8, linestyle="--", alpha=0.6)
-        ax_rsi.axhline(30, color=COLORS["green"], linewidth=0.8, linestyle="--", alpha=0.6)
-        ax_rsi.axhline(50, color=COLORS["grid"], linewidth=0.6, alpha=0.5)
-        ax_rsi.fill_between(x, 70, rsi, where=(rsi >= 70),
-                            alpha=0.15, color=COLORS["red"])
-        ax_rsi.fill_between(x, rsi, 30, where=(rsi <= 30),
-                            alpha=0.15, color=COLORS["green"])
-        ax_rsi.set_ylim(0, 100)
-        ax_rsi.set_yticks([30, 50, 70])
-        ax_rsi.tick_params(colors=COLORS["text_dim"], labelsize=7)
+        # ---- MACD PANELI ----
+        _draw_macd(ax_macd, c, x, n)
+        ax_macd.set_ylabel("MACD", color=CC["TEXT_COLOR"], fontsize=7)
+        ax_macd.set_xlabel("Mumlar", color=CC["TEXT_COLOR"], fontsize=8)
 
-        # X o'qi: vaqt belgilari
-        tick_step = max(1, len(df) // 8)
-        tick_idx = x[::tick_step]
-        tick_labels = [str(df["timestamp"].iloc[i].strftime("%m/%d %H:%M"))
-                       if i < len(df) else "" for i in tick_idx]
-        ax_rsi.set_xticks(tick_idx)
-        ax_rsi.set_xticklabels(tick_labels, rotation=20, ha="right",
-                                color=COLORS["text_dim"], fontsize=7)
+        # X o'qi belgilari
+        plt.setp(ax_price.get_xticklabels(), visible=False)
+        plt.setp(ax_vol.get_xticklabels(), visible=False)
+        plt.setp(ax_rsi.get_xticklabels(), visible=False)
 
-        # Watermark
-        fig.text(0.5, 0.02, "Halol Crypto AI — Ta'lim maqsadida",
-                 ha="center", color=COLORS["text_dim"], fontsize=8, alpha=0.5)
+        plt.tight_layout(pad=0.5)
 
-        # PNG ga saqlash
+        # Byte formatida eksport
         buf = io.BytesIO()
         plt.savefig(buf, format="png", bbox_inches="tight",
-                    facecolor=COLORS["bg"], dpi=CHART_DPI)
+                    facecolor=CC["BACKGROUND_COLOR"], dpi=CC["DPI"])
         plt.close(fig)
         buf.seek(0)
         return buf.read()
 
     except Exception as e:
-        logger.error(f"Grafik xatosi {result.symbol}: {e}", exc_info=True)
+        logger.error(f"Grafik yaratish xatosi: {e}")
         try:
             plt.close("all")
         except Exception:
             pass
         return None
+
+
+# ============================================================
+# CANDLESTICK CHIZISH
+# ============================================================
+
+def _draw_candlesticks(ax, x, o, h, lo, c):
+    """Candlestick mumlarni chizish."""
+    width = 0.6
+    for i in range(len(x)):
+        color = CC["UP_COLOR"] if c[i] >= o[i] else CC["DOWN_COLOR"]
+        # Shadow (fil)
+        ax.plot([x[i], x[i]], [lo[i], h[i]], color=color, linewidth=0.8, alpha=0.9)
+        # Tana
+        body_low = min(o[i], c[i])
+        body_high = max(o[i], c[i])
+        ax.add_patch(FancyBboxPatch(
+            (x[i] - width / 2, body_low),
+            width, body_high - body_low,
+            linewidth=0, color=color, alpha=0.85
+        ))
+
+
+# ============================================================
+# EMA CHIZIQLARI
+# ============================================================
+
+def _draw_emas(ax, close: np.ndarray, x, n: int):
+    """EMA20, EMA50, EMA200 chizish."""
+    full_close = close  # To'liq ma'lumot kerak
+    ema20 = ema(full_close, P["EMA_SHORT"])[-n:]
+    ema50 = ema(full_close, P["EMA_MID"])[-n:]
+    ema200 = ema(full_close, P["EMA_LONG"])[-n:]
+
+    valid20 = ema20[ema20 > 0]
+    valid50 = ema50[ema50 > 0]
+    valid200 = ema200[ema200 > 0]
+
+    if len(valid20) > 5:
+        start20 = n - len(valid20)
+        ax.plot(x[start20:], valid20, color=CC["EMA20_COLOR"],
+                linewidth=1.2, label="EMA20", alpha=0.9)
+    if len(valid50) > 5:
+        start50 = n - len(valid50)
+        ax.plot(x[start50:], valid50, color=CC["EMA50_COLOR"],
+                linewidth=1.2, label="EMA50", alpha=0.9)
+    if len(valid200) > 5:
+        start200 = n - len(valid200)
+        ax.plot(x[start200:], valid200, color=CC["EMA200_COLOR"],
+                linewidth=1.5, label="EMA200", alpha=0.9)
+
+    ax.legend(loc="upper left", fontsize=7, facecolor=CC["BACKGROUND_COLOR"],
+              labelcolor=CC["TEXT_COLOR"], framealpha=0.7)
+
+
+# ============================================================
+# ZONA CHIZISH (Order Block / FVG)
+# ============================================================
+
+def _draw_zone(ax, x, low_price: float, high_price: float, color: str, label: str):
+    """Rang zonasini chizish."""
+    ax.axhspan(low_price, high_price, color=color, alpha=0.3)
+    mid = (low_price + high_price) / 2
+    ax.annotate(label, xy=(len(x) - 1, mid), color=color,
+                fontsize=7, va="center", alpha=0.8)
+
+
+# ============================================================
+# TP DARAJALARI
+# ============================================================
+
+def _draw_tp_levels(ax, signal: SignalResult, n: int):
+    """TP1, TP2, TP3 darajalarini chizish."""
+    tp_data = [
+        (signal.tp1, CC["TP1_COLOR"], "TP1"),
+        (signal.tp2, CC["TP2_COLOR"], "TP2"),
+        (signal.tp3, CC["TP3_COLOR"], "TP3"),
+    ]
+    for tp_price, color, label in tp_data:
+        if tp_price > 0:
+            ax.axhline(tp_price, color=color, linewidth=1.2,
+                       linestyle=":", alpha=0.8)
+            ax.annotate(
+                f"🎯 {label}: {_fmt(tp_price)}",
+                xy=(n - 1, tp_price), xytext=(n - 15, tp_price),
+                color=color, fontsize=7, va="center"
+            )
+
+
+# ============================================================
+# HAJM PANELI
+# ============================================================
+
+def _draw_volume(ax, x, v, o, c):
+    """Hajm panelini chizish."""
+    colors = [CC["UP_COLOR"] if c[i] >= o[i] else CC["DOWN_COLOR"] for i in range(len(x))]
+    ax.bar(x, v, color=colors, alpha=0.7, width=0.7)
+
+    vol_ma = sma(v, min(20, len(v)))
+    valid_ma = vol_ma[~np.isnan(vol_ma)]
+    if len(valid_ma) > 5:
+        start = len(v) - len(valid_ma)
+        ax.plot(x[start:], valid_ma, color="#ffa657", linewidth=1.0, alpha=0.8)
+
+
+# ============================================================
+# RSI PANELI
+# ============================================================
+
+def _draw_rsi(ax, close: np.ndarray, x, n: int):
+    """RSI panelini chizish."""
+    from utils import rsi as calc_rsi_util
+    rsi_vals = calc_rsi_util(close, P["RSI_PERIOD"])[-n:]
+
+    valid_mask = rsi_vals > 0
+    if valid_mask.sum() > 5:
+        ax.plot(x[valid_mask], rsi_vals[valid_mask],
+                color="#79c0ff", linewidth=1.2, alpha=0.9)
+
+    ax.axhline(70, color=CC["DOWN_COLOR"], linewidth=0.8, linestyle="--", alpha=0.6)
+    ax.axhline(30, color=CC["UP_COLOR"], linewidth=0.8, linestyle="--", alpha=0.6)
+    ax.fill_between(x[valid_mask], rsi_vals[valid_mask], 70,
+                    where=(rsi_vals[valid_mask] > 70), color=CC["DOWN_COLOR"],
+                    alpha=0.15)
+    ax.fill_between(x[valid_mask], rsi_vals[valid_mask], 30,
+                    where=(rsi_vals[valid_mask] < 30), color=CC["UP_COLOR"],
+                    alpha=0.15)
+    ax.set_ylim(0, 100)
+
+
+# ============================================================
+# MACD PANELI
+# ============================================================
+
+def _draw_macd(ax, close: np.ndarray, x, n: int):
+    """MACD panelini chizish."""
+    from utils import macd as calc_macd_util
+    macd_line, signal_line, histogram = calc_macd_util(
+        close, P["MACD_FAST"], P["MACD_SLOW"], P["MACD_SIGNAL"]
+    )
+    macd_line = macd_line[-n:]
+    signal_line = signal_line[-n:]
+    histogram = histogram[-n:]
+
+    colors = [CC["UP_COLOR"] if h >= 0 else CC["DOWN_COLOR"] for h in histogram]
+    ax.bar(x, histogram, color=colors, alpha=0.5, width=0.7)
+
+    valid_macd = macd_line != 0
+    if valid_macd.sum() > 5:
+        ax.plot(x[valid_macd], macd_line[valid_macd],
+                color="#79c0ff", linewidth=1.0, alpha=0.9, label="MACD")
+        ax.plot(x[valid_macd], signal_line[valid_macd],
+                color="#ffa657", linewidth=1.0, alpha=0.9, label="Signal")
+    ax.axhline(0, color=CC["GRID_COLOR"], linewidth=0.8, alpha=0.8)
+    ax.legend(loc="upper left", fontsize=6, facecolor=CC["BACKGROUND_COLOR"],
+              labelcolor=CC["TEXT_COLOR"], framealpha=0.5)
+
+
+# ============================================================
+# YORDAMCHI FUNKSIYA
+# ============================================================
+
+def _fmt(price: float) -> str:
+    """Narxni qisqacha formatlash."""
+    if price >= 1000:
+        return f"${price:,.2f}"
+    elif price >= 1:
+        return f"${price:.4f}"
+    elif price >= 0.001:
+        return f"${price:.6f}"
+    else:
+        return f"${price:.8f}"
