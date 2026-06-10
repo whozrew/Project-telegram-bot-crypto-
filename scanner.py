@@ -1,336 +1,384 @@
 """
-Halol Crypto AI Bot - Bozor skaneri va ma'lumot oluvchi
+scanner.py - HALOL CRYPTO AI BOT V3.5
+Bozor skanerlash mexanizmi — faqat halol spot savdo
 """
+
 import asyncio
 import logging
 import time
-from typing import Dict, List, Optional, Any, Tuple
-from datetime import datetime
+from typing import Dict, List, Optional, Tuple
 
 import aiohttp
-import pandas as pd
 import numpy as np
 
 from config import (
-    BINANCE_BASE_URL, HALAL_COINS,
-    PRICE_CACHE_TTL_SECONDS, MARKET_CACHE_TTL_SECONDS,
+    HALAL_COINS, TIMEFRAMES, CACHE_TTL, ALERT_COOLDOWN,
+    ALERT_THRESHOLD, SCAN_INTERVAL
 )
+from signals import (
+    OHLCV, Indicators, MarketStructure, SignalResult,
+    parse_klines, compute_indicators, analyze_market_structure,
+    compute_confidence, compute_risk_levels, determine_signal_type,
+    determine_risk_level, combine_mtf_signals, compute_market_health
+)
+from database import (
+    cache_get, cache_set, cache_clear_expired,
+    get_all_active_users, get_watchlist, check_alert_cooldown,
+    record_alert, save_signal
+)
+from utils import fetch_klines, fetch_ticker, fetch_all_tickers, safe_float
 
 logger = logging.getLogger(__name__)
 
-# ──────────────────────────────────────────────
-# GLOBAL CACHE (barcha foydalanuvchilar uchun bitta)
-# ──────────────────────────────────────────────
 
-class MarketCache:
-    def __init__(self):
-        self._prices: Dict[str, Dict] = {}
-        self._klines: Dict[str, pd.DataFrame] = {}
-        self._ticker_24h: Dict[str, Dict] = {}
-        self._last_price_update: float = 0
-        self._last_kline_update: Dict[str, float] = {}
-        self._lock = asyncio.Lock()
+# ============================================================
+# TANGA TAHLILI
+# ============================================================
 
-    def is_price_stale(self) -> bool:
-        return time.time() - self._last_price_update > PRICE_CACHE_TTL_SECONDS
+async def analyze_coin(session: aiohttp.ClientSession,
+                        symbol: str,
+                        primary_tf: str = "1h",
+                        full_mtf: bool = True) -> Optional[SignalResult]:
+    """
+    Bir tangani to'liq tahlil qilish.
+    Ko'p vaqt oraliq, smart money, risk boshqaruvi.
+    """
+    cache_key = f"signal:{symbol}:{primary_tf}"
+    cached = cache_get(cache_key)
+    if cached:
+        return _dict_to_signal(cached)
 
-    def is_kline_stale(self, symbol: str) -> bool:
-        last = self._last_kline_update.get(symbol, 0)
-        return time.time() - last > MARKET_CACHE_TTL_SECONDS
+    result = SignalResult(symbol=symbol)
 
-    def get_price(self, symbol: str) -> Optional[float]:
-        data = self._prices.get(symbol)
-        if data and data.get("price", 0) > 0:
-            return data["price"]
+    # ---- TICKER MA'LUMOTLARI ----
+    ticker = await fetch_ticker(session, symbol)
+    if ticker:
+        result.price = safe_float(ticker.get("lastPrice", 0))
+        result.change_24h = safe_float(ticker.get("priceChangePercent", 0))
+
+    if result.price <= 0:
         return None
 
-    def get_ticker(self, symbol: str) -> Optional[Dict]:
-        return self._ticker_24h.get(symbol)
+    # ---- ASOSIY VAQT ORALIQ TAHLILI ----
+    tf_conf = TIMEFRAMES.get(primary_tf, TIMEFRAMES["1h"])
+    raw = await fetch_klines(session, symbol, tf_conf["interval"], tf_conf["limit"])
+    ohlcv = parse_klines(raw)
+    if not ohlcv:
+        return None
 
-    def get_klines(self, symbol: str) -> Optional[pd.DataFrame]:
-        return self._klines.get(symbol)
+    ind = compute_indicators(ohlcv)
+    ms = analyze_market_structure(ohlcv)
+    confidence, entry_quality, reasoning = compute_confidence(ind, ms, result.price)
 
-    def set_prices(self, prices: Dict):
-        self._prices = prices
-        self._last_price_update = time.time()
+    # ---- KO'P VAQT ORALIQ TAHLILI ----
+    if full_mtf:
+        mtf_scores: Dict[str, int] = {primary_tf: confidence}
+        for tf_name in ["15m", "1h", "4h", "1d"]:
+            if tf_name == primary_tf:
+                continue
+            tf_raw = await fetch_klines(
+                session, symbol,
+                TIMEFRAMES[tf_name]["interval"],
+                TIMEFRAMES[tf_name]["limit"]
+            )
+            tf_ohlcv = parse_klines(tf_raw)
+            if tf_ohlcv:
+                tf_ind = compute_indicators(tf_ohlcv)
+                tf_ms = analyze_market_structure(tf_ohlcv)
+                tf_conf_val, _, _ = compute_confidence(tf_ind, tf_ms, result.price)
+                mtf_scores[tf_name] = tf_conf_val
 
-    def set_ticker(self, symbol: str, data: Dict):
-        self._ticker_24h[symbol] = data
+        combined_conf, mtf_reasoning = combine_mtf_signals(mtf_scores)
+        confidence = combined_conf
+        reasoning.extend(mtf_reasoning)
 
-    def set_klines(self, symbol: str, df: pd.DataFrame):
-        self._klines[symbol] = df
-        self._last_kline_update[symbol] = time.time()
+    # ---- SIGNAL ANIQLASH ----
+    signal_type = determine_signal_type(confidence, ms)
+    risk_level = determine_risk_level(confidence)
 
-    def all_symbols(self) -> List[str]:
-        return list(self._prices.keys())
+    # ---- RISK BOSHQARUVI ----
+    stop_loss, tp1, tp2, tp3, risk_reward = compute_risk_levels(
+        result.price, ind, ms
+    )
+
+    # ---- NATIJANI TO'LDIRISH ----
+    result.signal_type = signal_type
+    result.confidence = confidence
+    result.entry_quality = entry_quality
+    result.risk_level = risk_level
+    result.stop_loss = stop_loss
+    result.tp1 = tp1
+    result.tp2 = tp2
+    result.tp3 = tp3
+    result.risk_reward = risk_reward
+    result.rvol = ind.rvol
+    result.trend = ms.trend
+    result.timeframe = primary_tf
+    result.reasoning = reasoning
+
+    result.indicators = {
+        "rsi": ind.rsi,
+        "ema20": ind.ema20,
+        "ema50": ind.ema50,
+        "ema200": ind.ema200,
+        "macd_line": ind.macd_line,
+        "macd_signal": ind.macd_signal,
+        "macd_hist": ind.macd_hist,
+        "adx": ind.adx,
+        "di_plus": ind.di_plus,
+        "di_minus": ind.di_minus,
+        "bb_upper": ind.bb_upper,
+        "bb_lower": ind.bb_lower,
+        "atr": ind.atr,
+        "rvol": ind.rvol,
+        "volume_ma": ind.volume_ma,
+    }
+
+    result.structure = {
+        "trend": ms.trend,
+        "support": ms.support,
+        "resistance": ms.resistance,
+        "order_block_bull": ms.order_block_bull,
+        "order_block_bear": ms.order_block_bear,
+        "fvg_bull": ms.fvg_bull,
+        "bos_bullish": ms.bos_bullish,
+        "choch_bullish": ms.choch_bullish,
+        "liquidity_sweep_bull": ms.liquidity_sweep_bull,
+        "breakout_detected": ms.breakout_detected,
+        "retest_confirmed": ms.retest_confirmed,
+        "higher_highs": ms.higher_highs,
+        "higher_lows": ms.higher_lows,
+    }
+
+    # Keshga saqlash
+    cache_set(cache_key, _signal_to_dict(result), CACHE_TTL)
+
+    # Signal tarixini saqlash
+    try:
+        save_signal(symbol, _signal_to_dict(result))
+    except Exception:
+        pass
+
+    return result
 
 
-# Global cache obyekti
-market_cache = MarketCache()
+# ============================================================
+# BARCHA TANGALARNI SKANERLASH
+# ============================================================
 
+async def scan_all_coins(session: aiohttp.ClientSession,
+                          coins: Optional[List[str]] = None) -> List[SignalResult]:
+    """Barcha halol tangalarni parallel skanerlash."""
+    target_coins = coins or HALAL_COINS
+    results: List[SignalResult] = []
 
-# ──────────────────────────────────────────────
-# BINANCE API WRAPPER
-# ──────────────────────────────────────────────
+    logger.info(f"🔍 {len(target_coins)} tanga skanerlash boshlanmoqda...")
 
-class BinanceClient:
-    def __init__(self):
-        self.base_url = BINANCE_BASE_URL
-        self.session: Optional[aiohttp.ClientSession] = None
-        self._semaphore = asyncio.Semaphore(10)  # Max 10 parallel requests
+    # Concurrency chegarasi: API limitlarini hurmat qilish
+    semaphore = asyncio.Semaphore(5)
 
-    async def start(self):
-        timeout = aiohttp.ClientTimeout(total=15, connect=5)
-        connector = aiohttp.TCPConnector(limit=20, ttl_dns_cache=300)
-        self.session = aiohttp.ClientSession(
-            timeout=timeout,
-            connector=connector,
-            headers={"User-Agent": "HalolCryptoBot/1.0"}
-        )
-
-    async def close(self):
-        if self.session:
-            await self.session.close()
-
-    async def _get(self, endpoint: str, params: Dict = None, retries: int = 3) -> Optional[Any]:
-        """Binance API'ga so'rov yuborish (retry bilan)"""
-        for attempt in range(retries):
+    async def analyze_with_limit(symbol: str):
+        async with semaphore:
             try:
-                async with self._semaphore:
-                    url = f"{self.base_url}{endpoint}"
-                    async with self.session.get(url, params=params) as resp:
-                        if resp.status == 200:
-                            return await resp.json()
-                        elif resp.status == 429:
-                            wait = 2 ** attempt
-                            logger.warning(f"Rate limit! {wait}s kutish...")
-                            await asyncio.sleep(wait)
-                        else:
-                            logger.warning(f"API xatosi {resp.status}: {endpoint}")
-            except asyncio.TimeoutError:
-                logger.warning(f"Timeout ({attempt+1}/{retries}): {endpoint}")
-                await asyncio.sleep(1)
+                result = await analyze_coin(session, symbol, "1h", full_mtf=False)
+                if result:
+                    results.append(result)
             except Exception as e:
-                logger.error(f"So'rov xatosi ({attempt+1}/{retries}): {e}")
-                await asyncio.sleep(1)
-        return None
+                logger.debug(f"Skanerlash xatosi {symbol}: {e}")
 
-    async def fetch_all_prices(self) -> Dict[str, float]:
-        """Barcha coinlar narxini olish"""
-        data = await self._get("/api/v3/ticker/price")
-        if not data:
-            return {}
-        result = {}
-        for item in data:
-            sym = item.get("symbol", "")
-            if sym.endswith("USDT"):
-                coin = sym[:-4]
-                try:
-                    price = float(item["price"])
-                    if price > 0:
-                        result[coin] = {"symbol": coin, "price": price}
-                except (ValueError, KeyError):
-                    pass
-        return result
+    await asyncio.gather(*[analyze_with_limit(sym) for sym in target_coins])
+    logger.info(f"✅ Skanerlash yakunlandi: {len(results)}/{len(target_coins)} tanga")
+    return results
 
-    async def fetch_ticker_24h(self, symbol: str) -> Optional[Dict]:
-        """24 soatlik statistika"""
-        data = await self._get("/api/v3/ticker/24hr", {"symbol": f"{symbol}USDT"})
-        if not data:
-            return None
+
+# ============================================================
+# KUCHLI SIGNALLARNI TOPISH
+# ============================================================
+
+async def find_strong_signals(session: aiohttp.ClientSession,
+                               threshold: int = None) -> List[SignalResult]:
+    """Barcha tangalar orasidan kuchli signallarni topish."""
+    min_threshold = threshold or ALERT_THRESHOLD
+    all_signals = await scan_all_coins(session)
+    strong = [
+        s for s in all_signals
+        if s.confidence >= min_threshold and s.signal_type in ("STRONG_BUY", "BUY")
+    ]
+    strong.sort(key=lambda x: x.confidence, reverse=True)
+    return strong
+
+
+# ============================================================
+# TREND REYTINGI
+# ============================================================
+
+async def get_coin_rankings(session: aiohttp.ClientSession,
+                             limit: int = 20) -> Dict[str, List[SignalResult]]:
+    """Tangalarni turli mezonlar bo'yicha reytinglash."""
+    all_signals = await scan_all_coins(session)
+
+    # Eng kuchli trend
+    by_confidence = sorted(all_signals, key=lambda x: x.confidence, reverse=True)[:limit]
+
+    # Eng yuqori RVOL
+    by_rvol = sorted(all_signals, key=lambda x: x.rvol, reverse=True)[:limit]
+
+    # Eng yaxshi R:R
+    by_rr = sorted(
+        [s for s in all_signals if s.risk_reward > 0],
+        key=lambda x: x.risk_reward, reverse=True
+    )[:limit]
+
+    # Eng yaxshi kirish sifati
+    by_quality = sorted(all_signals, key=lambda x: x.entry_quality, reverse=True)[:limit]
+
+    return {
+        "by_confidence": by_confidence,
+        "by_rvol": by_rvol,
+        "by_rr": by_rr,
+        "by_quality": by_quality,
+    }
+
+
+# ============================================================
+# WATCHLIST YANGILASH
+# ============================================================
+
+async def update_watchlist_signals(
+        session: aiohttp.ClientSession,
+        user_id: int,
+        symbols: List[str]
+) -> List[SignalResult]:
+    """Foydalanuvchi kuzatuv ro'yxatini yangilash."""
+    results = []
+    for symbol in symbols:
         try:
-            return {
-                "symbol": symbol,
-                "price": float(data["lastPrice"]),
-                "change_pct": float(data["priceChangePercent"]),
-                "high": float(data["highPrice"]),
-                "low": float(data["lowPrice"]),
-                "volume": float(data["volume"]),
-                "quote_volume": float(data["quoteVolume"]),
-                "open": float(data["openPrice"]),
-            }
-        except (KeyError, ValueError) as e:
-            logger.error(f"Ticker parse xatosi {symbol}: {e}")
-            return None
-
-    async def fetch_multiple_tickers(self, symbols: List[str]) -> Dict[str, Dict]:
-        """Ko'p coinlar uchun 24h ticker"""
-        tasks = [self.fetch_ticker_24h(s) for s in symbols]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        out = {}
-        for sym, res in zip(symbols, results):
-            if isinstance(res, dict) and res:
-                out[sym] = res
-        return out
-
-    async def fetch_klines(self, symbol: str, interval: str = "1h",
-                            limit: int = 200) -> Optional[pd.DataFrame]:
-        """OHLCV ma'lumotlarini olish"""
-        data = await self._get("/api/v3/klines", {
-            "symbol": f"{symbol}USDT",
-            "interval": interval,
-            "limit": limit
-        })
-        if not data or len(data) < 50:
-            return None
-        try:
-            df = pd.DataFrame(data, columns=[
-                "timestamp", "open", "high", "low", "close",
-                "volume", "close_time", "quote_volume", "trades",
-                "taker_buy_vol", "taker_buy_quote", "ignore"
-            ])
-            for col in ["open", "high", "low", "close", "volume", "quote_volume"]:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
-            df = df.dropna(subset=["close"])
-            df = df[df["close"] > 0]
-            return df if len(df) >= 20 else None
+            result = await analyze_coin(session, symbol, "1h", full_mtf=True)
+            if result:
+                results.append(result)
         except Exception as e:
-            logger.error(f"Kline parse xatosi {symbol}: {e}")
-            return None
-
-    async def fetch_all_tickers_bulk(self) -> Dict[str, Dict]:
-        """Barcha tickerlarni bir so'rovda olish"""
-        data = await self._get("/api/v3/ticker/24hr")
-        if not data:
-            return {}
-        result = {}
-        for item in data:
-            sym = item.get("symbol", "")
-            if sym.endswith("USDT"):
-                coin = sym[:-4]
-                if coin in HALAL_COINS:
-                    try:
-                        result[coin] = {
-                            "symbol": coin,
-                            "price": float(item["lastPrice"]),
-                            "change_pct": float(item["priceChangePercent"]),
-                            "high": float(item["highPrice"]),
-                            "low": float(item["lowPrice"]),
-                            "volume": float(item["volume"]),
-                            "quote_volume": float(item["quoteVolume"]),
-                            "open": float(item["openPrice"]),
-                        }
-                    except (ValueError, KeyError):
-                        pass
-        return result
+            logger.debug(f"Watchlist yangilash xatosi {symbol}: {e}")
+    return results
 
 
-# Global Binance client
-binance = BinanceClient()
+# ============================================================
+# FOYDALANUVCHILARGA OGOHLANTIRISH YUBORISH
+# ============================================================
+
+async def check_and_alert_users(
+        session: aiohttp.ClientSession,
+        application,
+        strong_signals: List[SignalResult]
+) -> int:
+    """Kuchli signallar uchun foydalanuvchilarga ogohlantirish yuborish."""
+    from bot import format_signal_message  # Circular import dan saqlanish
+
+    if not strong_signals:
+        return 0
+
+    users = get_all_active_users()
+    sent_count = 0
+
+    for user in users:
+        uid = user["user_id"]
+        user_watchlist = get_watchlist(uid)
+
+        for signal in strong_signals:
+            # Faqat kuzatuv ro'yxatidagi tangalar
+            if signal.symbol not in user_watchlist:
+                continue
+
+            # Cooldown tekshiruvi
+            if check_alert_cooldown(uid, signal.symbol, ALERT_COOLDOWN):
+                continue
+
+            try:
+                msg = format_signal_message(signal)
+                await application.bot.send_message(
+                    chat_id=uid,
+                    text=msg,
+                    parse_mode="HTML"
+                )
+                record_alert(uid, signal.symbol, signal.signal_type,
+                             signal.confidence, signal.price)
+                sent_count += 1
+                await asyncio.sleep(0.1)  # Flood protection
+            except Exception as e:
+                logger.warning(f"Xabar yuborish xatosi {uid}: {e}")
+
+    return sent_count
 
 
-# ──────────────────────────────────────────────
-# MARKET SCANNER
-# ──────────────────────────────────────────────
+# ============================================================
+# GLOBAL SKANERLASH TSIKLI
+# ============================================================
 
-class MarketScanner:
-    """
-    Bir marta scan qiladi va natijalarni cache'da saqlaydi.
-    Barcha foydalanuvchilar bir xil cache'dan foydalanadi.
-    """
-    def __init__(self):
-        self._scanning = False
-        self._last_full_scan: float = 0
-        self._scan_results: Dict[str, Any] = {}
+async def continuous_scanner(application, interval: int = SCAN_INTERVAL):
+    """Uzluksiz bozor skaneri."""
+    logger.info(f"🚀 Uzluksiz skaner ishga tushdi (interval: {interval}s)")
 
-    @property
-    def scan_results(self) -> Dict[str, Any]:
-        return self._scan_results
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                start_time = time.time()
+                logger.info("📡 Bozor skanerlash boshlandi...")
 
-    async def update_prices(self):
-        """Narxlarni yangilash"""
-        if not market_cache.is_price_stale():
-            return
+                # Barcha kuchli signallarni topish
+                strong_signals = await find_strong_signals(session)
 
-        prices = await binance.fetch_all_prices()
-        if prices:
-            market_cache.set_prices(prices)
-            logger.debug(f"Narxlar yangilandi: {len(prices)} ta coin")
+                if strong_signals:
+                    logger.info(f"🔥 {len(strong_signals)} kuchli signal topildi")
+                    sent = await check_and_alert_users(session, application, strong_signals)
+                    logger.info(f"📨 {sent} ogohlantirish yuborildi")
 
-    async def update_tickers(self):
-        """24h ticker yangilash"""
-        tickers = await binance.fetch_all_tickers_bulk()
-        for sym, data in tickers.items():
-            market_cache.set_ticker(sym, data)
-        logger.debug(f"Tickerlar yangilandi: {len(tickers)} ta coin")
+                # Muddati o'tgan keshni tozalash
+                cache_clear_expired()
 
-    async def update_klines_for_symbols(self, symbols: List[str]):
-        """Ko'rsatilgan coinlar uchun kline yangilash"""
-        stale = [s for s in symbols if market_cache.is_kline_stale(s)]
-        if not stale:
-            return
+                elapsed = time.time() - start_time
+                sleep_time = max(0, interval - elapsed)
+                logger.info(f"⏱️ Keyingi skan: {sleep_time:.0f}s")
+                await asyncio.sleep(sleep_time)
 
-        # Parallel ravishda olish (5 ta bir vaqtda)
-        chunk_size = 5
-        for i in range(0, len(stale), chunk_size):
-            chunk = stale[i:i + chunk_size]
-            tasks = [binance.fetch_klines(s) for s in chunk]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            for sym, df in zip(chunk, results):
-                if isinstance(df, pd.DataFrame) and df is not None:
-                    market_cache.set_klines(sym, df)
-
-    async def run_full_scan(self, symbols: List[str]) -> Dict[str, Any]:
-        """To'liq market skanerlash"""
-        if self._scanning:
-            return self._scan_results
-
-        self._scanning = True
-        try:
-            await self.update_prices()
-            await self.update_tickers()
-            await self.update_klines_for_symbols(symbols)
-            self._last_full_scan = time.time()
-            logger.info(f"✅ Market scan tugadi: {len(symbols)} ta coin")
-        except Exception as e:
-            logger.error(f"Market scan xatosi: {e}")
-        finally:
-            self._scanning = False
-
-        return self._scan_results
-
-    def get_top_gainers(self, n: int = 10) -> List[Dict]:
-        """Eng ko'p o'sgan coinlar"""
-        results = []
-        for sym in HALAL_COINS:
-            ticker = market_cache.get_ticker(sym)
-            if ticker and ticker.get("quote_volume", 0) > 100_000:
-                results.append(ticker)
-        results.sort(key=lambda x: x.get("change_pct", 0), reverse=True)
-        return results[:n]
-
-    def get_market_sentiment(self) -> Dict:
-        """Umumiy bozor kayfiyati"""
-        positive = 0
-        negative = 0
-        total = 0
-        for sym in HALAL_COINS:
-            ticker = market_cache.get_ticker(sym)
-            if ticker:
-                total += 1
-                chg = ticker.get("change_pct", 0)
-                if chg > 0:
-                    positive += 1
-                elif chg < 0:
-                    negative += 1
-        if total == 0:
-            return {"trend": "neutral", "positive_pct": 50, "negative_pct": 50}
-        pos_pct = (positive / total) * 100
-        neg_pct = (negative / total) * 100
-        if pos_pct >= 60:
-            trend = "bullish"
-        elif neg_pct >= 60:
-            trend = "bearish"
-        else:
-            trend = "neutral"
-        return {
-            "trend": trend,
-            "positive_pct": round(pos_pct),
-            "negative_pct": round(neg_pct),
-            "total_coins": total,
-        }
+            except asyncio.CancelledError:
+                logger.info("Skaner to'xtatildi")
+                break
+            except Exception as e:
+                logger.error(f"Skaner xatosi: {e}")
+                await asyncio.sleep(60)
 
 
-# Global scanner
-market_scanner = MarketScanner()
+# ============================================================
+# YORDAMCHI FUNKSIYALAR
+# ============================================================
+
+def _signal_to_dict(signal: SignalResult) -> dict:
+    """SignalResult ni dictionary ga aylantirish."""
+    return {
+        "symbol": signal.symbol,
+        "signal_type": signal.signal_type,
+        "confidence": signal.confidence,
+        "entry_quality": signal.entry_quality,
+        "risk_level": signal.risk_level,
+        "price": signal.price,
+        "change_24h": signal.change_24h,
+        "stop_loss": signal.stop_loss,
+        "tp1": signal.tp1,
+        "tp2": signal.tp2,
+        "tp3": signal.tp3,
+        "risk_reward": signal.risk_reward,
+        "rvol": signal.rvol,
+        "trend": signal.trend,
+        "indicators": signal.indicators,
+        "structure": signal.structure,
+        "reasoning": signal.reasoning,
+        "timeframe": signal.timeframe,
+    }
+
+
+def _dict_to_signal(d: dict) -> SignalResult:
+    """Dictionary ni SignalResult ga aylantirish."""
+    s = SignalResult()
+    for k, v in d.items():
+        if hasattr(s, k):
+            setattr(s, k, v)
+    return s

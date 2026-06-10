@@ -1,8 +1,31 @@
-python-telegram-bot[job-queue]==21.6
-aiohttp==3.9.5
-aiosqlite==0.20.0
-apscheduler==3.10.4
-matplotlib==3.9.2
-pandas==2.2.2
-numpy==1.26.4
-python-dotenv==1.0.1
+# ============================================================
+# HALOL CRYPTO AI BOT V3.5 - Kutubxonalar
+# ============================================================
+
+# Telegram Bot Framework
+python-telegram-bot==20.7
+
+# HTTP so'rovlar uchun
+aiohttp==3.9.1
+requests==2.31.0
+
+# Ma'lumotlar tahlili
+numpy==1.26.2
+pandas==2.1.4
+
+# Grafiklar uchun
+matplotlib==3.8.2
+mplfinance==0.12.10b0
+Pillow==10.1.0
+
+# Ma'lumotlar bazasi
+# SQLite - Python standart kutubxonasida mavjud
+
+# Atrof-muhit o'zgaruvchilari
+python-dotenv==1.0.0
+
+# Vaqt zonalari
+pytz==2023.3.post1
+
+# Cache uchun
+cachetools==5.3.2

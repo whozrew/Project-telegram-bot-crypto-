@@ -1,251 +1,319 @@
 """
-Halol Crypto AI Bot - Yordamchi funksiyalar
+utils.py - HALOL CRYPTO AI BOT V3.5
+Yordamchi funksiyalar va formatlash vositalari
 """
+
 import logging
 import asyncio
-from typing import Optional, List
+import time
+from typing import Optional, List, Tuple
 from datetime import datetime
 
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import TelegramError, RetryAfter, Forbidden, BadRequest
+import aiohttp
+import numpy as np
+
+from config import (
+    BINANCE_BASE_URL, BINANCE_KLINES_URL, BINANCE_TICKER_URL,
+    API_REQUEST_DELAY, HALAL_COINS, EXCLUDED_PATTERNS
+)
 
 logger = logging.getLogger(__name__)
 
 
-async def safe_send_message(
-    bot: Bot,
-    chat_id: int,
-    text: str,
-    parse_mode: str = "Markdown",
-    reply_markup=None,
-    photo: bytes = None,
-) -> Optional[int]:
-    """Xabar yuborish (xatolik holati uchun)"""
+# ============================================================
+# BINANCE API SO'ROVLARI
+# ============================================================
+
+async def fetch_klines(session: aiohttp.ClientSession, symbol: str,
+                       interval: str, limit: int = 200) -> Optional[List]:
+    """Binance'dan OHLCV ma'lumotlarini olish."""
     try:
-        if photo:
-            msg = await bot.send_photo(
-                chat_id=chat_id,
-                photo=photo,
-                caption=text[:1024],
-                parse_mode=parse_mode,
-                reply_markup=reply_markup,
-            )
-        else:
-            msg = await bot.send_message(
-                chat_id=chat_id,
-                text=text,
-                parse_mode=parse_mode,
-                reply_markup=reply_markup,
-                disable_web_page_preview=True,
-            )
-        return msg.message_id
-    except RetryAfter as e:
-        logger.warning(f"Rate limit: {e.retry_after}s kutish ({chat_id})")
-        await asyncio.sleep(e.retry_after + 1)
-        return await safe_send_message(bot, chat_id, text, parse_mode, reply_markup, photo)
-    except Forbidden:
-        logger.warning(f"Bot {chat_id} ga xabar yubora olmadi (bloklangan)")
-        return None
-    except BadRequest as e:
-        logger.warning(f"Noto'g'ri so'rov {chat_id}: {e}")
-        if "can't parse" in str(e).lower():
-            return await safe_send_message(bot, chat_id, text, "HTML", reply_markup, photo)
-        return None
-    except TelegramError as e:
-        logger.error(f"Telegram xatosi {chat_id}: {e}")
+        await asyncio.sleep(API_REQUEST_DELAY)
+        url = f"{BINANCE_KLINES_URL}?symbol={symbol}&interval={interval}&limit={limit}"
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status == 200:
+                return await resp.json()
+            else:
+                logger.warning(f"Kline xatosi {symbol} {interval}: {resp.status}")
+                return None
+    except asyncio.TimeoutError:
+        logger.warning(f"Timeout: {symbol} {interval}")
         return None
     except Exception as e:
-        logger.error(f"Kutilmagan xato {chat_id}: {e}")
+        logger.error(f"Kline fetch xatosi {symbol}: {e}")
         return None
 
 
-async def broadcast_to_users(
-    bot: Bot,
-    user_chat_ids: List[int],
-    text: str,
-    photo: bytes = None,
-    parse_mode: str = "Markdown",
-    delay: float = 0.05,
-):
-    """Ko'p foydalanuvchilarga xabar yuborish (spam oldini olish)"""
-    success = 0
-    fail = 0
-    for chat_id in user_chat_ids:
-        result = await safe_send_message(bot, chat_id, text, parse_mode, photo=photo)
-        if result:
-            success += 1
-        else:
-            fail += 1
-        await asyncio.sleep(delay)
-    logger.info(f"Broadcast: {success} ta muvaffaqiyatli, {fail} ta muvaffaqiyatsiz")
-    return success, fail
+async def fetch_ticker(session: aiohttp.ClientSession,
+                       symbol: str) -> Optional[dict]:
+    """Binance'dan 24h ticker ma'lumotlarini olish."""
+    try:
+        url = f"{BINANCE_TICKER_URL}?symbol={symbol}"
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status == 200:
+                return await resp.json()
+            return None
+    except Exception as e:
+        logger.error(f"Ticker fetch xatosi {symbol}: {e}")
+        return None
 
 
-def build_main_menu() -> InlineKeyboardMarkup:
-    """Asosiy menyu tugmalar"""
-    keyboard = [
-        [
-            InlineKeyboardButton("📡 Signal", callback_data="signal"),
-            InlineKeyboardButton("🪙 Coinlar", callback_data="coins"),
-        ],
-        [
-            InlineKeyboardButton("⭐ Mening Coinlarim", callback_data="watchlist"),
-            InlineKeyboardButton("📈 Bozor", callback_data="market"),
-        ],
-        [
-            InlineKeyboardButton("🚀 O'sayotgan Coinlar", callback_data="rising"),
-            InlineKeyboardButton("📊 Top Imkoniyatlar", callback_data="top_opps"),
-        ],
-        [
-            InlineKeyboardButton("✅ Halol Coinlar", callback_data="halal_coins"),
-            InlineKeyboardButton("❌ Haram Coinlar", callback_data="haram_coins"),
-        ],
-        [
-            InlineKeyboardButton("⚠️ Meme Coinlar", callback_data="meme_coins"),
-            InlineKeyboardButton("⚙️ Sozlamalar", callback_data="settings"),
-        ],
-        [
-            InlineKeyboardButton("ℹ️ Yordam", callback_data="help"),
-        ],
-    ]
-    return InlineKeyboardMarkup(keyboard)
+async def fetch_all_tickers(session: aiohttp.ClientSession) -> Optional[List]:
+    """Barcha tickerlarni bir so'rovda olish."""
+    try:
+        url = BINANCE_TICKER_URL
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            if resp.status == 200:
+                return await resp.json()
+            return None
+    except Exception as e:
+        logger.error(f"All tickers fetch xatosi: {e}")
+        return None
 
 
-def build_back_button(data: str = "main_menu") -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("◀️ Orqaga", callback_data=data)
-    ]])
+# ============================================================
+# NARX FORMATLASH
+# ============================================================
+
+def format_price(price: float) -> str:
+    """Narxni o'qilishi qulay formatda ko'rsatish."""
+    if price == 0:
+        return "0"
+    if price >= 1000:
+        return f"{price:,.2f}"
+    elif price >= 1:
+        return f"{price:.4f}"
+    elif price >= 0.01:
+        return f"{price:.5f}"
+    elif price >= 0.0001:
+        return f"{price:.6f}"
+    else:
+        return f"{price:.8f}"
 
 
-def build_coin_keyboard(coins: List[str], selected: List[str],
-                         page: int = 0, per_page: int = 20) -> InlineKeyboardMarkup:
-    """Coin tanlash klaviaturasi"""
-    start = page * per_page
-    end = start + per_page
-    page_coins = coins[start:end]
-
-    keyboard = []
-    row = []
-    for i, coin in enumerate(page_coins):
-        check = "✅" if coin in selected else "◻️"
-        row.append(InlineKeyboardButton(
-            f"{check} {coin}", callback_data=f"toggle_{coin}"
-        ))
-        if len(row) == 3 or i == len(page_coins) - 1:
-            keyboard.append(row)
-            row = []
-
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton("◀️", callback_data=f"coin_page_{page-1}"))
-    nav.append(InlineKeyboardButton(
-        f"{page+1}/{(len(coins)-1)//per_page+1}", callback_data="noop"
-    ))
-    if end < len(coins):
-        nav.append(InlineKeyboardButton("▶️", callback_data=f"coin_page_{page+1}"))
-    if nav:
-        keyboard.append(nav)
-
-    keyboard.append([InlineKeyboardButton("✅ Saqlash", callback_data="save_watchlist")])
-    keyboard.append([InlineKeyboardButton("◀️ Orqaga", callback_data="main_menu")])
-    return InlineKeyboardMarkup(keyboard)
+def format_pct(pct: float) -> str:
+    """Foizni formatlash."""
+    sign = "+" if pct >= 0 else ""
+    return f"{sign}{pct:.2f}%"
 
 
-def build_watchlist_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✏️ Coinlarni o'zgartirish", callback_data="edit_watchlist")],
-        [InlineKeyboardButton("🗑️ Tozalash", callback_data="clear_watchlist")],
-        [InlineKeyboardButton("◀️ Orqaga", callback_data="main_menu")],
-    ])
+def format_volume(vol: float) -> str:
+    """Hajmni formatlash (K, M, B)."""
+    if vol >= 1_000_000_000:
+        return f"{vol / 1_000_000_000:.2f}B"
+    elif vol >= 1_000_000:
+        return f"{vol / 1_000_000:.2f}M"
+    elif vol >= 1_000:
+        return f"{vol / 1_000:.2f}K"
+    else:
+        return f"{vol:.2f}"
 
 
-def build_settings_menu(alerts_on: bool) -> InlineKeyboardMarkup:
-    alerts_btn = (
-        InlineKeyboardButton("🔕 Alertlarni o'chirish", callback_data="alerts_off")
-        if alerts_on
-        else InlineKeyboardButton("🔔 Alertlarni yoqish", callback_data="alerts_on")
+def get_symbol_base(symbol: str) -> str:
+    """BTCUSDT -> BTC."""
+    for quote in ["USDT", "BTC", "ETH", "BNB"]:
+        if symbol.endswith(quote):
+            return symbol[: -len(quote)]
+    return symbol
+
+
+# ============================================================
+# HALOLLIK TEKSHIRUVI
+# ============================================================
+
+def is_halal_symbol(symbol: str) -> bool:
+    """Tanganing halol va qo'llab-quvvatlanishini tekshirish."""
+    symbol_upper = symbol.upper()
+    for pattern in EXCLUDED_PATTERNS:
+        if pattern in symbol_upper:
+            return False
+    return symbol_upper in [s.upper() for s in HALAL_COINS]
+
+
+def normalize_symbol(symbol: str) -> str:
+    """Tanga belgisini normallashtirish."""
+    symbol = symbol.upper().strip()
+    if not symbol.endswith("USDT"):
+        symbol = symbol + "USDT"
+    return symbol
+
+
+# ============================================================
+# NUMPY YORDAMCHI FUNKSIYALARI
+# ============================================================
+
+def safe_float(value, default: float = 0.0) -> float:
+    """Xavfsiz float konvertatsiya."""
+    try:
+        f = float(value)
+        return f if not (np.isnan(f) or np.isinf(f)) else default
+    except (TypeError, ValueError):
+        return default
+
+
+def ema(data: np.ndarray, period: int) -> np.ndarray:
+    """Eksponensial harakatlanuvchi o'rtacha hisoblash."""
+    result = np.zeros(len(data))
+    if len(data) < period:
+        return result
+    multiplier = 2.0 / (period + 1)
+    result[period - 1] = np.mean(data[:period])
+    for i in range(period, len(data)):
+        result[i] = (data[i] - result[i - 1]) * multiplier + result[i - 1]
+    return result
+
+
+def sma(data: np.ndarray, period: int) -> np.ndarray:
+    """Oddiy harakatlanuvchi o'rtacha hisoblash."""
+    result = np.full(len(data), np.nan)
+    for i in range(period - 1, len(data)):
+        result[i] = np.mean(data[i - period + 1: i + 1])
+    return result
+
+
+def rsi(close: np.ndarray, period: int = 14) -> np.ndarray:
+    """RSI hisoblash."""
+    if len(close) < period + 1:
+        return np.zeros(len(close))
+    deltas = np.diff(close)
+    gains = np.where(deltas > 0, deltas, 0.0)
+    losses = np.where(deltas < 0, -deltas, 0.0)
+
+    avg_gain = np.zeros(len(close))
+    avg_loss = np.zeros(len(close))
+    avg_gain[period] = np.mean(gains[:period])
+    avg_loss[period] = np.mean(losses[:period])
+
+    for i in range(period + 1, len(close)):
+        avg_gain[i] = (avg_gain[i - 1] * (period - 1) + gains[i - 1]) / period
+        avg_loss[i] = (avg_loss[i - 1] * (period - 1) + losses[i - 1]) / period
+
+    rs = np.where(avg_loss != 0, avg_gain / avg_loss, 100.0)
+    rsi_values = np.where(avg_loss == 0, 100.0, 100.0 - (100.0 / (1.0 + rs)))
+    return rsi_values
+
+
+def atr(high: np.ndarray, low: np.ndarray, close: np.ndarray,
+        period: int = 14) -> np.ndarray:
+    """ATR hisoblash."""
+    if len(high) < 2:
+        return np.zeros(len(high))
+    tr = np.maximum(
+        high[1:] - low[1:],
+        np.maximum(
+            np.abs(high[1:] - close[:-1]),
+            np.abs(low[1:] - close[:-1])
+        )
     )
-    return InlineKeyboardMarkup([
-        [alerts_btn],
-        [InlineKeyboardButton("⭐ Coinlarim", callback_data="edit_watchlist")],
-        [InlineKeyboardButton("◀️ Orqaga", callback_data="main_menu")],
+    atr_values = np.zeros(len(high))
+    if len(tr) >= period:
+        atr_values[period] = np.mean(tr[:period])
+        for i in range(period + 1, len(high)):
+            atr_values[i] = (atr_values[i - 1] * (period - 1) + tr[i - 1]) / period
+    return atr_values
+
+
+def adx(high: np.ndarray, low: np.ndarray, close: np.ndarray,
+        period: int = 14) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """ADX, +DI, -DI hisoblash."""
+    n = len(high)
+    if n < period + 1:
+        return np.zeros(n), np.zeros(n), np.zeros(n)
+
+    plus_dm = np.zeros(n)
+    minus_dm = np.zeros(n)
+    tr_arr = np.zeros(n)
+
+    for i in range(1, n):
+        h_diff = high[i] - high[i - 1]
+        l_diff = low[i - 1] - low[i]
+        plus_dm[i] = h_diff if (h_diff > l_diff and h_diff > 0) else 0
+        minus_dm[i] = l_diff if (l_diff > h_diff and l_diff > 0) else 0
+        tr_arr[i] = max(high[i] - low[i],
+                        abs(high[i] - close[i - 1]),
+                        abs(low[i] - close[i - 1]))
+
+    atr14 = np.zeros(n)
+    sm_plus = np.zeros(n)
+    sm_minus = np.zeros(n)
+
+    atr14[period] = np.sum(tr_arr[1: period + 1])
+    sm_plus[period] = np.sum(plus_dm[1: period + 1])
+    sm_minus[period] = np.sum(minus_dm[1: period + 1])
+
+    for i in range(period + 1, n):
+        atr14[i] = atr14[i - 1] - atr14[i - 1] / period + tr_arr[i]
+        sm_plus[i] = sm_plus[i - 1] - sm_plus[i - 1] / period + plus_dm[i]
+        sm_minus[i] = sm_minus[i - 1] - sm_minus[i - 1] / period + minus_dm[i]
+
+    di_plus = np.where(atr14 > 0, 100 * sm_plus / atr14, 0)
+    di_minus = np.where(atr14 > 0, 100 * sm_minus / atr14, 0)
+    di_diff = np.abs(di_plus - di_minus)
+    di_sum = di_plus + di_minus
+    dx = np.where(di_sum > 0, 100 * di_diff / di_sum, 0)
+
+    adx_values = np.zeros(n)
+    start = 2 * period
+    if n > start:
+        adx_values[start] = np.mean(dx[period: start + 1])
+        for i in range(start + 1, n):
+            adx_values[i] = (adx_values[i - 1] * (period - 1) + dx[i]) / period
+
+    return adx_values, di_plus, di_minus
+
+
+def bollinger_bands(close: np.ndarray, period: int = 20,
+                    std_dev: float = 2.0) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Bollinger Bands hisoblash."""
+    mid = sma(close, period)
+    std = np.array([
+        np.std(close[max(0, i - period + 1): i + 1])
+        if i >= period - 1 else np.nan
+        for i in range(len(close))
     ])
+    upper = mid + std_dev * std
+    lower = mid - std_dev * std
+    return upper, mid, lower
 
 
-def setup_logging(log_level: str = "INFO", log_file: str = "bot.log"):
-    """Logging sozlash"""
-    log_format = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+def macd(close: np.ndarray, fast: int = 12, slow: int = 26,
+         signal: int = 9) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """MACD hisoblash."""
+    ema_fast = ema(close, fast)
+    ema_slow = ema(close, slow)
+    macd_line = ema_fast - ema_slow
+    signal_line = ema(macd_line, signal)
+    histogram = macd_line - signal_line
+    return macd_line, signal_line, histogram
+
+
+# ============================================================
+# VAQT FORMATLASH
+# ============================================================
+
+def now_str() -> str:
+    """Hozirgi vaqtni string ko'rinishida qaytarish."""
+    return datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+
+
+def timestamp_to_str(ts_ms: int) -> str:
+    """Millisekund timestampni string ko'rinishiga o'tkazish."""
+    dt = datetime.utcfromtimestamp(ts_ms / 1000)
+    return dt.strftime("%Y-%m-%d %H:%M")
+
+
+# ============================================================
+# KUZATUV YORDAMCHISI
+# ============================================================
+
+def setup_logging(level: str = "INFO") -> None:
+    """Logging tizimini sozlash."""
+    numeric_level = getattr(logging, level.upper(), logging.INFO)
     logging.basicConfig(
-        level=getattr(logging, log_level.upper(), logging.INFO),
-        format=log_format,
-        handlers=[
-            logging.StreamHandler(),
-            logging.FileHandler(log_file, encoding="utf-8"),
-        ],
+        level=numeric_level,
+        format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
-    # Tashqi kutubxonalarni susaytirish
+    logging.getLogger("telegram").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("aiohttp").setLevel(logging.WARNING)
-    logging.getLogger("matplotlib").setLevel(logging.WARNING)
-    logging.getLogger("telegram").setLevel(logging.WARNING)
-    logging.getLogger("apscheduler").setLevel(logging.WARNING)
-
-
-WELCOME_TEXT = """
-🌟 *Halol Crypto AI Botiga Xush Kelibsiz!*
-
-Assalomu alaykum! Men sizga halol kripto pul bozorini tahlil qilishda yordam beraman.
-
-*Bot nima qiladi?*
-
-📡 Halol kripto valyutalarni real vaqtda kuzatadi
-📊 Kuchli signal va imkoniyatlarni aniqlaydi
-🚀 Eng tez o'suvchi coinlar haqida xabar beradi
-📈 Bozor holatini tushuntiradi
-⚡ Kuchli imkoniyatlarda darhol ogohlantiradi
-
-*Halollik haqida:*
-
-✅ Faqat halol screened coinlar tahlil qilinadi
-❌ Meme coinlar va haram tokenlar istisno
-⚠️ Barcha signallar ta'lim maqsadida
-
-*Muhim eslatma:*
-_Bu bot moliyaviy maslahat bermaydi. Investitsiya qarorlari faqat sizning mas'uliyatingiz._
-
-👇 Boshlash uchun tugmani bosing:
-"""
-
-HELP_TEXT = """
-ℹ️ *Yordam va Qo'llanma*
-
-*Asosiy buyruqlar:*
-/start — Botni boshlash
-/signal — Tezkor signal olish
-/market — Bozor holati
-/rising — O'sayotgan coinlar
-/top — Top imkoniyatlar
-/watchlist — Mening coinlarim
-/settings — Sozlamalar
-/help — Yordam
-
-*Qanday ishlaydi?*
-
-1. ⭐ *Mening Coinlarim* — Kuzatmoqchi coinlarni tanlang
-2. 📡 *Signal* — Istalgan coin bo'yicha signal oling
-3. 📊 *Top Imkoniyatlar* — Eng yaxshi 10 imkoniyatni ko'ring
-4. 🚀 *O'sayotgan Coinlar* — Eng tez o'suvchi coinlar
-
-*Signallar haqida:*
-
-🟢 KUCHLI SOTIB OLISH — Juda kuchli signal
-🟢 SOTIB OLISH — Kuchli signal
-🟡 KUTISH — Kuchli signal yo'q
-🔴 SOTISH — Sotish signal
-🔴 KUCHLI SOTISH — Juda kuchli sotish
-
-*Guruh xususiyatlari:*
-Bot guruhda ham ishlaydi. Kuchli signallar guruhga ham yuboriladi.
-
-⚠️ _Barcha signallar ta'lim maqsadida._
-"""
